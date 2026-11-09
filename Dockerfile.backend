@@ -11,5 +11,5 @@ COPY backend/scripts ./scripts
 RUN useradd --system --uid 10001 spc && chown -R spc /app
 USER spc
 EXPOSE 8000
-# "::" listens on IPv6 and IPv4 so the service is reachable over Railway's private network
-CMD ["sh", "-c", "exec uvicorn app.main:app --host :: --port ${PORT:-8000}"]
+# listens on IPv4 and IPv6 (Railway private networking may use either)
+CMD ["python", "-m", "app.serve"]
