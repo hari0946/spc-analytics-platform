@@ -45,6 +45,8 @@ def _connect() -> SnowflakeConnection:
         "login_timeout": s.snowflake_login_timeout,
         "network_timeout": 60,
         "application": "SPC_Analytics_Platform",
+        # keeps the session token fresh so a long-running server does not hit "Authentication token has expired"
+        "client_session_keep_alive": True,
         # all timestamps (defaults, sessions, audit) are UTC regardless of account default
         "session_parameters": {"TIMEZONE": "UTC"},
     }
@@ -85,23 +87,42 @@ def close_connection() -> None:
             _connection = None
 
 
+# 390114 / 390111: session or token expired; 250001 / 08001: could not connect / connection lost
+_EXPIRED_CODES = {390114, 390111, 250001, 250002}
+
+
+def _is_expired(e: Exception) -> bool:
+    return getattr(e, "errno", None) in _EXPIRED_CODES or getattr(e, "sqlstate", None) == "08001"
+
+
 @contextmanager
 def cursor() -> Iterator[Any]:
     cur = get_connection().cursor()
     try:
         yield cur
+    except SnowflakeError as e:
+        if _is_expired(e):
+            close_connection()  # next call opens a fresh connection
+        raise
     finally:
-        cur.close()
+        try:
+            cur.close()
+        except SnowflakeError:
+            pass
 
 
 def execute(sql: str, params: Sequence[Any] | dict | None = None) -> list[tuple]:
     """Run a parameterized query (use %s / %(name)s placeholders) and return all rows."""
-    try:
-        with cursor() as cur:
-            cur.execute(sql, params)
-            return cur.fetchall()
-    except SnowflakeError as e:
-        raise SnowflakeConnectionError(f"Query failed: {getattr(e, 'msg', None) or type(e).__name__}") from e
+    for attempt in (1, 2):
+        try:
+            with cursor() as cur:
+                cur.execute(sql, params)
+                return cur.fetchall()
+        except SnowflakeError as e:
+            if attempt == 1 and _is_expired(e):
+                logger.warning("Snowflake session expired; reconnecting and retrying once")
+                continue
+            raise SnowflakeConnectionError(f"Query failed: {getattr(e, 'msg', None) or type(e).__name__}") from e
 
 
 def test_connection() -> dict:
